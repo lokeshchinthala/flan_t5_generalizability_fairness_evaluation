@@ -4,29 +4,75 @@ FLAN-T5 for Social Isolation Detection
 This script performs fine tuning of FLAN-T5-large across multiple healthcare sites for social isolation detection.
 """
 import torch
-import torch.nn.functional as F
-from torch.nn.functional import softmax
 from transformers import T5Tokenizer, T5ForConditionalGeneration, Trainer, TrainingArguments
 
-import os
 import re
-import string
 import json
-from collections import defaultdict, Counter
+from collections import Counter
 import unicodedata
 import pandas as pd
 import numpy as np
 import random
-from datasets import Dataset, DatasetDict
+from datasets import Dataset
 
+# Classifiction
+from sklearn.metrics import f1_score, accuracy_score, precision_recall_fscore_support, classification_report
+from sklearn.model_selection import train_test_split
 
 def main():
+    # Define valid labels
+    valid_labels = ['no social reference', 'social isolation', 'social support']
+
+    def clean_text(text):
+        if not isinstance(text, str) or not text.strip():
+            return ""
+            
+        text = text.upper()
+        
+        # Normalize weird spaces and symbols
+        text = unicodedata.normalize("NFKC", text)
+        text = text.replace("�", " ")
+        text = text.replace("UNABLE TO DISPLAY)", "UNABLE TO DISPLAY")
+        text = re.sub(r"<OBX\.5\.\d+>", " ", text)
+        text = re.sub(r"&lt;|&gt;", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        
+        return text
+
+    # Function to set random seed for reproducibility
+    def set_seed(seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
     # Set random seed
     seed_value = 43
     set_seed(seed_value)
 
     # Clear GPU Memory
     torch.cuda.empty_cache()
+
+    # Load data
+    def load_json_file(file_path):
+        all_data = []
+    
+        with open(file_path, "r", encoding="utf-8") as file:
+            try:
+                data = json.load(file)
+    
+                if isinstance(data, list):
+                    all_data.extend(data)
+                else:
+                    print(f"Unexpected format in file {file_path}, skipping.")
+    
+            except json.JSONDecodeError as e:
+                print(f"Error parsing JSON in {file_path}: {e}")
+    
+        return all_data
 
     # Load data 
     data = load_json_file('/data/reannotated_data.json')
@@ -37,11 +83,13 @@ def main():
         text = entry["text"]
         span = entry.get("span","")
         if span == None:
-            span = text
+            span = clean_text(text)
+        else:
+            span = clean_text(span)
         label = entry["label"]
-        processed_text = clean_text(text)
-        span_text = clean_text(span)
-        if label in valid_labels and span_text:
+        text = clean_text(text)
+        
+        if label in valid_labels and span:
             labelled_data.append({"text":text, "span": span, "label": label})
         else:
             unlabelled_data.append({"text":text, "span": span, "label": label})
@@ -59,9 +107,9 @@ def main():
 
     # Remove duplicates
     df = formatted_labelled_data.to_pandas()
-    no_si = df[df['label'] == 'no social isolation']
+    no_si = df[df['label'] == 'no social reference']
     no_si = no_si.drop_duplicates(subset=["text", "label"])
-    others = df[df['label'] != 'no social isolation']
+    others = df[df['label'] != 'no social reference']
     df_balanced = pd.concat([no_si, others], ignore_index=True)
 
     deduplicate_data = Dataset.from_pandas(df_balanced, preserve_index=False)
@@ -74,6 +122,36 @@ def main():
     # Tokenizer
     model_name = '/llm_model_files/models--google--flan-t5-large/snapshots/0613663d0d48ea86ba8cb3d7a44f0f65dc596a2a/'
     tokenizer = T5Tokenizer.from_pretrained(model_name)
+
+    def preprocess_function(example):
+        prompt = (
+            "Classify the span based on the context into one of: "
+            "['social isolation', 'no social reference', or 'social support'].\n"
+            f"Text: {example['text']}\n"
+            f"Span: {example['span']}\n\n"
+            "Label:"
+        )
+    
+        inputs = tokenizer(
+            prompt,
+            max_length=256,
+            truncation=True,
+            padding="max_length"
+        )
+    
+        labels = tokenizer(
+            text_target=example["label"],
+            max_length=10,
+            truncation=True,
+            padding="max_length"
+        )["input_ids"]
+    
+        inputs["labels"] = [
+            token if token != tokenizer.pad_token_id else -100
+            for token in labels
+        ]
+    
+        return inputs
 
     # Tokenize
     tokenized_train_data = train_data.map(preprocess_function, remove_columns=["text", "span", "label"])
@@ -117,6 +195,34 @@ def main():
 
     trainer.train()
 
+    # Evaluation
+    def predict(text, span, model, tokenizer):
+        prompt = (
+            "Classify the span based on the context into one of: "
+            "['social isolation', 'no social reference', or 'social support'].\n"
+            f"Text: {text}\n"
+            f"Span: {span}\n\n"
+            "Label:"
+        )
+    
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=256
+        ).to(model.device)
+    
+        with torch.no_grad():
+            output = model.generate(
+                inputs["input_ids"],
+                max_length=20
+            )
+    
+        return tokenizer.decode(
+            output[0],
+            skip_special_tokens=True
+        ).strip()
+    
     eval_results = trainer.evaluate()
     print("Evaluation results:", eval_results)
 
@@ -124,9 +230,15 @@ def main():
     true_labels, predicted_labels, spans = [], [], []
 
     for example in test_data:
-        span = example["text"]
         actual_label  = example.get("label", "unknown")
-        predicted_label = predict(example["text"], model, tokenizer)
+        text = example["text"]
+        span = example["span"]
+        predicted_label = predict(
+            text, 
+            span, 
+            model, 
+            tokenizer
+        ).strip().lower()
 
         spans.append(span)
         true_labels.append(actual_label)
